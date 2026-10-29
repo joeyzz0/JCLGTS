@@ -1,0 +1,32 @@
+modLoader = "javafml"
+loaderVersion = "[4,)"
+license = "MIT"
+
+[[mods]]
+modId = "jcl_gts"
+version = "${mod_version}"
+displayName = "Joey's Global Trade System"
+description = '''
+A chest-menu Global Trade System for Cobblemon servers. Buy it now or auction Pokemon and items for CobbleDollars with /gts.
+'''
+
+[[dependencies.jcl_gts]]
+modId = "neoforge"
+type = "required"
+versionRange = "[21.1,)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.jcl_gts]]
+modId = "minecraft"
+type = "required"
+versionRange = "[1.21.1,1.22)"
+ordering = "NONE"
+side = "BOTH"
+
+[[dependencies.jcl_gts]]
+modId = "cobblemon"
+type = "optional"
+versionRange = "[1.6,)"
+ordering = "AFTER"
+side = "BOTH"
