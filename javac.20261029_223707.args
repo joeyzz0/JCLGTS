@@ -1,0 +1,17 @@
+-proc:none
+-d
+/tmp/gout5
+ClaimEntry.java
+CobblemonBridge.java
+Economy.java
+Fmt.java
+GtsCommands.java
+GtsConfig.java
+GtsMod.java
+Gui.java
+Listing.java
+Market.java
+MarketData.java
+Refl.java
+Store.java
+Webhook.java

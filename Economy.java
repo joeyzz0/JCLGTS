@@ -51,45 +51,67 @@ public final class Economy {
         return runFull(server, command).out;
     }
 
-    /** Returns the player's CobbleDollars, or -1 if it could not be read. */
-    public static long balance(ServerPlayer p) {
-        Result r = runFull(p.server, "cd query " + p.getGameProfile().getName());
-        String text = r.out.replace(p.getGameProfile().getName(), "");
+    // ------------------------------------------------------------------ direct CobbleDollars calls
+    // CobbleDollars 2.x keeps each player's exact balance as a BigInteger and exposes it through
+    // PlayerExtensionKt.getCobbleDollars / setCobbleDollars. Its own /cd give and /cd remove commands use the same two calls.
+
+    private static java.lang.reflect.Method getM, setM;
+    private static boolean failedOnce;
+
+    private static boolean init() {
+        if (getM != null && setM != null) return true;
         try {
-            String rx = GtsConfig.INSTANCE.balanceRegex;
-            if (rx != null && !rx.isBlank()) {
-                Matcher m = Pattern.compile(rx).matcher(text);
-                if (m.find()) return Long.parseLong(m.group(1).replace(",", ""));
-            } else {
-                Matcher m = NUMBER.matcher(text);
-                String last = null;
-                while (m.find()) last = m.group(1);
-                if (last != null) return Long.parseLong(last.replace(",", ""));
-            }
-        } catch (Exception ignored) {}
-        // Many commands return the value itself as their result.
-        if (r.code != Integer.MIN_VALUE && r.code > 1) return r.code;
-        GtsMod.LOG.warn("[GTS] Could not read a balance. Command output: '{}', return value: {}, error: '{}'. Set balanceRegex in config/jcl_gts.json.", r.out.trim(), r.code, r.error);
-        return -1;
+            Class<?> ext = Class.forName("fr.harmex.cobbledollars.common.utils.extensions.PlayerExtensionKt");
+            getM = ext.getMethod("getCobbleDollars", net.minecraft.world.entity.player.Player.class);
+            setM = ext.getMethod("setCobbleDollars", net.minecraft.world.entity.player.Player.class, java.math.BigInteger.class);
+            return true;
+        } catch (Throwable t) {
+            if (!failedOnce) { failedOnce = true; GtsMod.LOG.error("[GTS] Could not connect to CobbleDollars (is it installed, and version 2.x?)", t); }
+            return false;
+        }
+    }
+
+    private static java.math.BigInteger raw(ServerPlayer p) throws Exception {
+        return (java.math.BigInteger) getM.invoke(null, p);
+    }
+
+    /** The player's exact CobbleDollars, or -1 if it can't be read. */
+    public static long balance(ServerPlayer p) {
+        if (!init()) return -1;
+        try {
+            java.math.BigInteger b = raw(p);
+            return b.min(java.math.BigInteger.valueOf(Long.MAX_VALUE)).longValue();
+        } catch (Throwable t) {
+            GtsMod.LOG.error("[GTS] Could not read a CobbleDollars balance", t);
+            return -1;
+        }
     }
 
     public static boolean give(ServerPlayer p, long amount) {
         if (amount <= 0) return true;
-        run(p.server, "cd give " + p.getGameProfile().getName() + " " + amount);
-        return true;
+        if (!init()) return false;
+        try {
+            setM.invoke(null, p, raw(p).add(java.math.BigInteger.valueOf(amount)));
+            return true;
+        } catch (Throwable t) {
+            GtsMod.LOG.error("[GTS] Could not give CobbleDollars", t);
+            return false;
+        }
     }
 
-    /** Takes money and checks the balance really dropped. */
+    /** Takes money, only if the player really has it. */
     public static boolean take(ServerPlayer p, long amount) {
         if (amount <= 0) return true;
-        long before = balance(p);
-        if (before < 0 || before < amount) return false;
-        run(p.server, "cd remove " + p.getGameProfile().getName() + " " + amount);
-        long after = balance(p);
-        if (after < 0) return false;
-        long removed = before - after;
-        if (removed >= amount) return true;
-        if (removed > 0) give(p, removed); // partial removal: put it back
-        return false;
+        if (!init()) return false;
+        try {
+            java.math.BigInteger have = raw(p);
+            java.math.BigInteger cost = java.math.BigInteger.valueOf(amount);
+            if (have.compareTo(cost) < 0) return false;
+            setM.invoke(null, p, have.subtract(cost));
+            return true;
+        } catch (Throwable t) {
+            GtsMod.LOG.error("[GTS] Could not take CobbleDollars", t);
+            return false;
+        }
     }
 }
