@@ -16,6 +16,25 @@ repositories {
     mavenCentral()
 }
 
+// Flat layout: every .java file sits next to this file, no folders needed.
+sourceSets {
+    main {
+        java {
+            srcDirs = ['.']
+            include '*.java'
+        }
+        resources {
+            srcDirs = []
+        }
+    }
+}
+
+processResources {
+    from('neoforge.mods.toml') {
+        into 'META-INF'
+    }
+}
+
 neoForge {
     version = '21.1.262'
 
@@ -30,13 +49,5 @@ neoForge {
         jcl_gts {
             sourceSet sourceSets.main
         }
-    }
-}
-
-tasks.withType(ProcessResources).configureEach {
-    var replaceProperties = [mod_version: project.version]
-    inputs.properties replaceProperties
-    filesMatching(['META-INF/neoforge.mods.toml']) {
-        expand replaceProperties
     }
 }

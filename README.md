@@ -29,6 +29,9 @@ Buy It Now and timed auctions for Pokémon and items, paid in CobbleDollars.
 * **Discord.** Put a webhook URL in `config/jcl_gts.json`. New listings, sales, auction results, "ending soon" alerts, and one live board message that is edited every 5 minutes.
 * **Saves.** `<world>/data/jcl_gts/market.json`, written atomically.
 
+## Layout
+All files sit in one folder on purpose (no src/ folders), so they can be uploaded to GitHub in one drag.
+
 ## Building
 1. Install JDK 21.
 2. In this folder run `gradle wrapper` once (needs Gradle 8.10 or newer), then `./gradlew build`.
@@ -45,3 +48,8 @@ Buy It Now and timed auctions for Pokémon and items, paid in CobbleDollars.
 
 ## Things written without being able to run them
 Cobblemon is reached through reflection so the mod builds without it. If a Pokémon detail line is missing in the menu, or the Pokémon icon shows a Poké Ball instead of the model, the server log names the part that failed (look for `[GTS] Could not read`).
+
+## Getting the jar without installing anything
+Push this folder to a GitHub repository. The included workflow (`.github/workflows/build.yml`) builds it on GitHub's servers.
+Open the repository's **Actions** tab, click the latest run, and download the **jcl_gts-jar** artifact. The jar inside goes in your `mods` folder.
+If the build fails, open the run and send me the red error text.
