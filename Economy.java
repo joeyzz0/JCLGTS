@@ -27,21 +27,34 @@ public final class Economy {
         @Override public boolean shouldInformAdmins() { return false; }
     }
 
-    private static String run(MinecraftServer server, String command) {
+    public static final class Result {
+        public String out = "";
+        public int code = Integer.MIN_VALUE;
+        public String error = "";
+    }
+
+    public static Result runFull(MinecraftServer server, String command) {
         Capture cap = new Capture();
+        Result r = new Result();
         CommandSourceStack src = new CommandSourceStack(cap, Vec3.ZERO, Vec2.ZERO, server.overworld(), 4, "GTS", Component.literal("GTS"), server, null);
         try {
-            server.getCommands().performPrefixedCommand(src, command);
+            r.code = server.getCommands().getDispatcher().execute(command, src);
         } catch (Throwable t) {
-            GtsMod.LOG.error("[GTS] Economy command failed: {}", command, t);
+            r.error = String.valueOf(t.getMessage());
+            GtsMod.LOG.warn("[GTS] Economy command '{}' failed: {}", command, t.toString());
         }
-        return cap.out.toString();
+        r.out = cap.out.toString();
+        return r;
+    }
+
+    private static String run(MinecraftServer server, String command) {
+        return runFull(server, command).out;
     }
 
     /** Returns the player's CobbleDollars, or -1 if it could not be read. */
     public static long balance(ServerPlayer p) {
-        String out = run(p.server, "cd query " + p.getGameProfile().getName());
-        String text = out.replace(p.getGameProfile().getName(), "");
+        Result r = runFull(p.server, "cd query " + p.getGameProfile().getName());
+        String text = r.out.replace(p.getGameProfile().getName(), "");
         try {
             String rx = GtsConfig.INSTANCE.balanceRegex;
             if (rx != null && !rx.isBlank()) {
@@ -54,7 +67,9 @@ public final class Economy {
                 if (last != null) return Long.parseLong(last.replace(",", ""));
             }
         } catch (Exception ignored) {}
-        GtsMod.LOG.warn("[GTS] Could not read a balance from the CobbleDollars output: '{}'. Set balanceRegex in config/jcl_gts.json.", out.trim());
+        // Many commands return the value itself as their result.
+        if (r.code != Integer.MIN_VALUE && r.code > 1) return r.code;
+        GtsMod.LOG.warn("[GTS] Could not read a balance. Command output: '{}', return value: {}, error: '{}'. Set balanceRegex in config/jcl_gts.json.", r.out.trim(), r.code, r.error);
         return -1;
     }
 

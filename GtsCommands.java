@@ -68,6 +68,17 @@ public final class GtsCommands {
                 })))
                 .then(Commands.literal("webhooktest").executes(ctx -> { Webhook.test(); ctx.getSource().sendSuccess(() -> Fmt.chat("Sent a test message to Discord."), false); return 1; }))
                 .then(Commands.literal("reload").executes(ctx -> { GtsConfig.load(); ctx.getSource().sendSuccess(() -> Fmt.chat("GTS config reloaded."), false); return 1; }))
+                .then(Commands.literal("debug").executes(ctx -> {
+                    ServerPlayer p = player(ctx);
+                    String name = p.getGameProfile().getName();
+                    for (String cmd : new String[]{"cd query " + name, "cobbledollars query " + name}) {
+                        Economy.Result r = Economy.runFull(p.server, cmd);
+                        p.sendSystemMessage(Fmt.chat("[GTS debug] /" + cmd, ChatFormatting.AQUA));
+                        p.sendSystemMessage(Fmt.chat("  text: '" + r.out.trim().replace("\n", " | ") + "'", ChatFormatting.GRAY));
+                        p.sendSystemMessage(Fmt.chat("  return value: " + (r.code == Integer.MIN_VALUE ? "none" : r.code) + (r.error.isEmpty() ? "" : "   error: " + r.error), ChatFormatting.GRAY));
+                    }
+                    return 1;
+                }))
                 .then(Commands.literal("balance").executes(ctx -> {
                     ServerPlayer p = player(ctx);
                     long b = Economy.balance(p);
