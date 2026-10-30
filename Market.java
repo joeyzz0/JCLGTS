@@ -1,13 +1,25 @@
 package net.joeyscobblemon.gts;
 
+import java.io.ByteArrayInputStream;
+import java.io.ByteArrayOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Base64;
 import java.util.Comparator;
 import java.util.List;
 import java.util.UUID;
+
+import com.mojang.serialization.DataResult;
+
 import net.minecraft.ChatFormatting;
 import net.minecraft.core.registries.BuiltInRegistries;
 import net.minecraft.nbt.CompoundTag;
+import net.minecraft.nbt.NbtAccounter;
+import net.minecraft.nbt.NbtIo;
+import net.minecraft.nbt.NbtOps;
+import net.minecraft.nbt.Tag;
 import net.minecraft.nbt.TagParser;
 import net.minecraft.network.chat.Component;
 import net.minecraft.resources.ResourceLocation;
@@ -75,17 +87,64 @@ public final class Market {
     }
 
     // ------------------------------------------------------------------ item encoding
+    //
+    // Items are stored as Minecraft's own binary NBT, base64 encoded, with a "b64:" prefix.
+    // Older saves used SNBT text; decode() still reads those.
 
-    public static String encode(ItemStack s) { return s.saveOptional(server.registryAccess()).toString(); }
+    private static final String B64 = "b64:";
 
-    public static ItemStack decode(String snbt) {
+    public static String encode(ItemStack s) {
+        if (s == null || s.isEmpty()) return "";
+        Tag tag = s.save(server.registryAccess());
         try {
-            CompoundTag t = TagParser.parseTag(snbt);
-            return ItemStack.parseOptional(server.registryAccess(), t);
+            ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+            try (DataOutputStream out = new DataOutputStream(bytes)) {
+                NbtIo.write((CompoundTag) tag, out);
+            }
+            return B64 + Base64.getEncoder().encodeToString(bytes.toByteArray());
         } catch (Exception e) {
-            GtsMod.LOG.error("[GTS] Could not read a saved item", e);
+            throw new IllegalStateException("Could not write item data", e);
+        }
+    }
+
+    public static ItemStack decode(String stored) {
+        if (stored == null || stored.isEmpty()) return ItemStack.EMPTY;
+        CompoundTag tag;
+        try {
+            if (stored.startsWith(B64)) {
+                byte[] raw = Base64.getDecoder().decode(stored.substring(B64.length()));
+                try (DataInputStream in = new DataInputStream(new ByteArrayInputStream(raw))) {
+                    tag = NbtIo.read(in, NbtAccounter.unlimitedHeap());
+                }
+            } else {
+                tag = TagParser.parseTag(stored);
+            }
+        } catch (Exception e) {
+            GtsMod.LOG.error("[GTS] Could not read saved item data", e);
             return ItemStack.EMPTY;
         }
+        if (tag.isEmpty()) return ItemStack.EMPTY;
+        DataResult<ItemStack> result = ItemStack.CODEC.parse(server.registryAccess().createSerializationContext(NbtOps.INSTANCE), tag);
+        if (result.error().isPresent()) {
+            GtsMod.LOG.error("[GTS] Could not rebuild a saved item: {} | data: {}", result.error().get().message(), tag);
+        }
+        return result.result().orElse(ItemStack.EMPTY);
+    }
+
+    /**
+     * Saves the item, reads it straight back and compares. Returns the saved data,
+     * or null if the item does not come back identical (then it must not be listed).
+     */
+    public static String encodeVerified(ItemStack s) {
+        try {
+            String stored = encode(s);
+            ItemStack back = decode(stored);
+            if (!back.isEmpty() && back.getCount() == s.getCount() && ItemStack.isSameItemSameComponents(back, s)) return stored;
+            GtsMod.LOG.warn("[GTS] {} did not survive a save test, so it was not listed.", s);
+        } catch (Exception e) {
+            GtsMod.LOG.error("[GTS] Could not save {} for the GTS", s, e);
+        }
+        return null;
     }
 
     // ------------------------------------------------------------------ queries
@@ -130,6 +189,11 @@ public final class Market {
         int n = 0;
         for (Listing l : data.listings.values()) if (l.seller.equals(seller)) n++;
         return n;
+    }
+
+    /** True if an item listing's goods can't be rebuilt right now. */
+    private static boolean undeliverable(Listing l) {
+        return l.kind == Listing.Kind.ITEM && decode(l.itemSnbt).isEmpty();
     }
 
     // ------------------------------------------------------------------ creating listings
@@ -178,7 +242,6 @@ public final class Market {
         ItemStack held = p.getMainHandItem();
         if (held.isEmpty()) return "Hold the item you want to sell in your main hand.";
         if (isRestricted(held)) return "That item can't be sold on the GTS.";
-
         ResourceLocation key = BuiltInRegistries.ITEM.getKey(held.getItem());
         if (key.getNamespace().equals("brecher_breeding") && key.getPath().contains("egg")) {
             try {
@@ -188,10 +251,11 @@ public final class Market {
                 if (!shows) return "This egg's contents are still hidden. Reveal the egg first, so buyers can see its nature and IVs.";
             } catch (Throwable ignored) {}
         }
-
         ItemStack stack = held.copy();
+        String stored = encodeVerified(stack);
+        if (stored == null) return "This item's data can't be stored safely, so it can't be listed on the GTS. It's still in your hand.";
         Listing l = base(p, Listing.Kind.ITEM, mode, price, hours);
-        l.itemSnbt = encode(stack);
+        l.itemSnbt = stored;
         l.title = stack.getHoverName().getString() + (stack.getCount() > 1 ? " x" + stack.getCount() : "");
         p.setItemInHand(InteractionHand.MAIN_HAND, ItemStack.EMPTY);
         add(l);
@@ -208,7 +272,6 @@ public final class Market {
             Object pk = CobblemonBridge.partyGet(party, slot - 1);
             if (pk == null) return "There is no Pokémon in party slot " + slot + ".";
             if (cfg().blockLastPokemon && CobblemonBridge.partyCount(party) <= 1) return "You can't list your only Pokémon.";
-
             CobblemonBridge.Snap snap = CobblemonBridge.snapshot(pk, server.registryAccess());
             CompoundTag nbt = CobblemonBridge.toNbt(pk, server.registryAccess());
             Listing l = base(p, Listing.Kind.POKEMON, mode, price, hours);
@@ -245,6 +308,7 @@ public final class Market {
         if (l.mode != Listing.Mode.BUY_NOW) return "That one is an auction. Place a bid instead.";
         if (l.seller.equals(buyer.getUUID())) return "You can't buy your own listing. Cancel it instead.";
         if (l.endsAt <= System.currentTimeMillis()) return "That listing has just ended.";
+        if (undeliverable(l)) return "This item can't be delivered right now. You were not charged. Tell an admin (listing #" + l.id + ").";
         long bal = Economy.balance(buyer);
         if (bal < 0) return "Could not read your CobbleDollars balance. Tell an admin.";
         if (bal < l.price) return "You need " + Fmt.cd(l.price) + " but only have " + Fmt.cd(bal) + ".";
@@ -267,6 +331,7 @@ public final class Market {
         long now = System.currentTimeMillis();
         if (l.endsAt <= now) return "That auction has just ended.";
         if (l.bidder != null && l.bidder.equals(p.getUUID())) return "You are already the highest bidder.";
+        if (undeliverable(l)) return "This item can't be delivered right now, so bidding is paused. Tell an admin (listing #" + l.id + ").";
         long min = minNextBid(l);
         if (amount < min) return "The lowest bid right now is " + Fmt.cd(min) + ".";
         if (amount > cfg().maxPrice) return "The highest bid allowed is " + Fmt.cd(cfg().maxPrice) + ".";
@@ -274,7 +339,6 @@ public final class Market {
         if (bal < 0) return "Could not read your CobbleDollars balance. Tell an admin.";
         if (bal < amount) return "You need " + Fmt.cd(amount) + " but only have " + Fmt.cd(bal) + ".";
         if (!Economy.take(p, amount)) return "The payment did not go through. You were not charged.";
-
         if (l.bidder != null) {
             pay(l.bidder, l.bidderName, l.currentBid, "Outbid on " + l.title);
             tell(l.bidder, Fmt.chat("[GTS] ", ChatFormatting.GOLD).append(Fmt.chat("You were outbid on ", ChatFormatting.YELLOW)).append(Component.literal(l.title)).append(Fmt.chat(". Your " + Fmt.cd(l.currentBid) + " was refunded.", ChatFormatting.YELLOW)));
@@ -355,12 +419,24 @@ public final class Market {
         giveGoods(l.seller, l.sellerName, l, reason);
     }
 
-    /** Hands the goods to the player directly if they are online and have room, otherwise stores them in claims. */
+    /**
+     * Hands the goods to the player directly if they are online and have room, otherwise stores them in claims.
+     * If an item can't be rebuilt, its saved data is kept in claims untouched, never thrown away.
+     */
     private static void giveGoods(UUID id, String name, Listing l, String reason) {
         ServerPlayer p = server.getPlayerList().getPlayer(id);
         if (l.kind == Listing.Kind.ITEM) {
             ItemStack s = decode(l.itemSnbt);
-            if (s.isEmpty()) return;
+            if (s.isEmpty()) {
+                GtsMod.LOG.error("[GTS] Listing #{} ({}) could not be rebuilt. Its data was kept in {}'s claims.", l.id, l.title, name);
+                ClaimEntry keep = new ClaimEntry();
+                keep.type = ClaimEntry.Type.ITEM;
+                keep.itemSnbt = l.itemSnbt;
+                keep.title = l.title;
+                keep.reason = reason;
+                data.claimsOf(id).add(keep);
+                return;
+            }
             if (p != null) p.getInventory().add(s);
             if (s.isEmpty()) return;
             ClaimEntry c = new ClaimEntry();
@@ -398,13 +474,14 @@ public final class Market {
         List<ClaimEntry> list = data.claims.get(p.getUUID().toString());
         if (list == null || list.isEmpty()) return 0;
         int done = 0;
+        int stuck = 0;
         for (ClaimEntry c : new ArrayList<>(list)) {
             boolean ok = false;
             switch (c.type) {
                 case MONEY -> ok = Economy.give(p, c.amount);
                 case ITEM -> {
                     ItemStack s = decode(c.itemSnbt);
-                    if (s.isEmpty()) { ok = true; break; }
+                    if (s.isEmpty()) { stuck++; break; }
                     p.getInventory().add(s);
                     if (s.isEmpty()) ok = true; else c.itemSnbt = encode(s);
                 }
@@ -416,6 +493,9 @@ public final class Market {
                 }
             }
             if (ok) { list.remove(c); done++; }
+        }
+        if (stuck > 0) {
+            p.sendSystemMessage(Fmt.chat("[GTS] ", ChatFormatting.GOLD).append(Fmt.chat(stuck + " item(s) couldn't be delivered and are being kept safe in your claims. Tell an admin.", ChatFormatting.RED)));
         }
         markDirty();
         Store.save(file(), data);
