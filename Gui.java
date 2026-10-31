@@ -6,11 +6,16 @@ import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 import java.util.function.Consumer;
-import net.minecraft.ChatFormatting;
+
 import net.minecraft.core.component.DataComponents;
+import net.minecraft.network.chat.ClickEvent;
 import net.minecraft.network.chat.Component;
+import net.minecraft.network.chat.HoverEvent;
+import net.minecraft.network.chat.MutableComponent;
 import net.minecraft.server.level.ServerPlayer;
-import net.minecraft.world.Container;
+import net.minecraft.sounds.SoundEvent;
+import net.minecraft.sounds.SoundEvents;
+import net.minecraft.sounds.SoundSource;
 import net.minecraft.world.SimpleContainer;
 import net.minecraft.world.SimpleMenuProvider;
 import net.minecraft.world.entity.player.Inventory;
@@ -18,52 +23,72 @@ import net.minecraft.world.entity.player.Player;
 import net.minecraft.world.inventory.ChestMenu;
 import net.minecraft.world.inventory.ClickType;
 import net.minecraft.world.inventory.MenuType;
+import net.minecraft.world.item.Item;
 import net.minecraft.world.item.ItemStack;
 import net.minecraft.world.item.Items;
 import net.minecraft.world.item.component.ItemLore;
 
-/** Chest-style menus. They run entirely on the server, so players see a normal chest screen. */
+/**
+ * The GTS menus: market, listing details, your listings, claims and the sell menu.
+ * Everything is a server-side chest menu, so players need nothing extra installed.
+ * Public entry points used by GtsCommands: browse, mine, claims, view.
+ */
 public final class Gui {
     private Gui() {}
 
-    public record Click(ServerPlayer player, ClickType type, int button) {}
+    // ================================================================== per-player browsing state
 
-    public static final class Screen {
+    static final class View {
+        int page;
+        Market.Filter filter = Market.Filter.ALL;
+        Market.Sort sort = Market.Sort.NEWEST;
+        String confirmBuy;   // listing id waiting for a second click on "Buy"
+    }
+
+    private static final Map<UUID, View> VIEWS = new HashMap<>();
+
+    static View view(ServerPlayer p) { return VIEWS.computeIfAbsent(p.getUUID(), u -> new View()); }
+
+    // ================================================================== menu plumbing
+
+    /** One screen: its title, its rows and what each slot shows and does. */
+    static final class Screen {
         final Component title;
-        final String titleKey;
         final int rows;
         final ItemStack[] icons;
-        final Map<Integer, Consumer<Click>> actions = new HashMap<>();
+        final Map<Integer, Consumer<ServerPlayer>> actions = new HashMap<>();
 
         Screen(String title, int rows) {
             this.title = Component.literal(title);
-            this.titleKey = title;
             this.rows = rows;
             this.icons = new ItemStack[rows * 9];
             for (int i = 0; i < icons.length; i++) icons[i] = ItemStack.EMPTY;
         }
 
-        void set(int slot, ItemStack s) { icons[slot] = s; }
-        void set(int slot, ItemStack s, Consumer<Click> action) { icons[slot] = s; actions.put(slot, action); }
+        void set(int slot, ItemStack icon) { icons[slot] = icon; actions.remove(slot); }
+        void set(int slot, ItemStack icon, Consumer<ServerPlayer> action) { icons[slot] = icon; actions.put(slot, action); }
 
-        void border(ItemStack pane) {
+        /** Fills the outer frame with a two-tone pattern. */
+        void frame(Item a, Item b) {
             for (int i = 0; i < icons.length; i++) {
                 int r = i / 9, c = i % 9;
-                if (r == 0 || r == rows - 1 || c == 0 || c == 8) icons[i] = pane.copy();
+                if (r == 0 || r == rows - 1 || c == 0 || c == 8) icons[i] = pane((r + c) % 2 == 0 ? a : b);
             }
         }
+
+        void fill(Item item) { for (int i = 0; i < icons.length; i++) if (icons[i].isEmpty()) icons[i] = pane(item); }
     }
 
     static final class GtsMenu extends ChestMenu {
-        final int rowCount;
         final SimpleContainer box;
+        final ServerPlayer viewer;
         Screen screen;
 
-        GtsMenu(int id, Inventory inv, SimpleContainer box, int rows, Screen screen) {
-            super(typeFor(rows), id, inv, box, rows);
-            this.rowCount = rows;
+        GtsMenu(int id, Inventory inv, SimpleContainer box, ServerPlayer viewer, Screen screen) {
+            super(typeFor(screen.rows), id, inv, box, screen.rows);
             this.box = box;
-            this.screen = screen;
+            this.viewer = viewer;
+            apply(screen);
         }
 
         static MenuType<?> typeFor(int rows) {
@@ -78,301 +103,333 @@ public final class Gui {
         }
 
         void apply(Screen s) {
-            this.screen = s;
-            for (int i = 0; i < rowCount * 9; i++) box.setItem(i, i < s.icons.length ? s.icons[i] : ItemStack.EMPTY);
-            box.setChanged();
-            broadcastChanges();
+            screen = s;
+            for (int i = 0; i < box.getContainerSize(); i++) box.setItem(i, i < s.icons.length ? s.icons[i].copy() : ItemStack.EMPTY);
+            broadcastFullState();
         }
 
         @Override
-        public void clicked(int slotId, int button, ClickType type, Player player) {
-            setCarried(ItemStack.EMPTY);
-            if (slotId >= 0 && slotId < rowCount * 9 && (type == ClickType.PICKUP || type == ClickType.QUICK_MOVE)) {
-                Consumer<Click> a = screen.actions.get(slotId);
-                if (a != null && player instanceof ServerPlayer sp) {
-                    try { a.accept(new Click(sp, type, button)); }
-                    catch (Throwable t) { GtsMod.LOG.error("[GTS] Menu click failed", t); sp.sendSystemMessage(Fmt.chat("[GTS] Something went wrong. Try again.", ChatFormatting.RED)); }
-                }
+        public void clicked(int slot, int button, ClickType type, Player player) {
+            // Every slot is a button. Nothing can be picked up, moved or shift-clicked.
+            if (slot >= 0 && slot < screen.icons.length) {
+                Consumer<ServerPlayer> a = screen.actions.get(slot);
+                if (a != null) a.accept(viewer);
             }
-            sendAllDataToRemote();
+            broadcastFullState();
         }
 
-        @Override public ItemStack quickMoveStack(Player p, int i) { return ItemStack.EMPTY; }
-        @Override public boolean stillValid(Player p) { return true; }
+        @Override public ItemStack quickMoveStack(Player player, int index) { return ItemStack.EMPTY; }
+        @Override public boolean stillValid(Player player) { return true; }
     }
 
+    /** Shows a screen, reusing the open menu when it has the same size so the cursor doesn't jump. */
     static void open(ServerPlayer p, Screen s) {
-        if (p.containerMenu instanceof GtsMenu m && m.rowCount == s.rows && m.screen.titleKey.equals(s.titleKey)) {
+        if (p.containerMenu instanceof GtsMenu m && m.screen.rows == s.rows && m.screen.title.getString().equals(s.title.getString())) {
             m.apply(s);
             return;
         }
-        p.openMenu(new SimpleMenuProvider((id, inv, pl) -> {
-            SimpleContainer box = new SimpleContainer(s.rows * 9);
-            GtsMenu m = new GtsMenu(id, inv, box, s.rows, s);
-            m.apply(s);
-            return m;
-        }, s.title));
+        SimpleContainer box = new SimpleContainer(s.rows * 9);
+        p.openMenu(new SimpleMenuProvider((id, inv, pl) -> new GtsMenu(id, inv, box, p, s), s.title));
     }
 
-    // ------------------------------------------------------------------ item builders
+    // ================================================================== item helpers
 
-    static ItemStack icon(net.minecraft.world.item.Item item, String name, ChatFormatting color, String... lore) {
-        ItemStack s = new ItemStack(item);
-        s.set(DataComponents.CUSTOM_NAME, Fmt.line(name, color));
-        if (lore.length > 0) {
-            List<Component> l = new ArrayList<>();
-            for (String x : lore) l.add(Fmt.line(x));
-            s.set(DataComponents.LORE, new ItemLore(l));
-        }
-        s.set(DataComponents.HIDE_ADDITIONAL_TOOLTIP, net.minecraft.util.Unit.INSTANCE);
-        return s;
-    }
-
-    static ItemStack pane(net.minecraft.world.item.Item item) {
+    static ItemStack pane(Item item) {
         ItemStack s = new ItemStack(item);
         s.set(DataComponents.CUSTOM_NAME, Component.literal(" "));
-        s.set(DataComponents.HIDE_ADDITIONAL_TOOLTIP, net.minecraft.util.Unit.INSTANCE);
+        s.set(DataComponents.HIDE_TOOLTIP, net.minecraft.util.Unit.INSTANCE);
         return s;
     }
 
-    /** The listing's item with the market info added under its own tooltip. */
-    static ItemStack display(Listing l, boolean detailed) {
-        ItemStack s = Market.decode(l.itemSnbt);
-        if (s.isEmpty()) s = new ItemStack(Items.BARRIER);
-        if (l.kind == Listing.Kind.POKEMON) s.set(DataComponents.CUSTOM_NAME, Component.literal(l.title).withStyle(st -> st.withItalic(false)));
-        List<Component> lore = new ArrayList<>();
-        ItemLore old = s.get(DataComponents.LORE);
-        if (l.kind == Listing.Kind.ITEM && old != null) lore.addAll(old.lines());
-        lore.add(Fmt.line(" "));
-        lore.add(Fmt.line("§8▬▬▬▬▬▬▬▬▬▬▬▬▬▬"));
-        if (l.kind == Listing.Kind.POKEMON) for (String d : l.details) lore.add(Fmt.line(d));
-        lore.add(Fmt.line("§7Seller: §f" + l.sellerName));
-        long now = System.currentTimeMillis();
-        if (l.mode == Listing.Mode.AUCTION) {
-            lore.add(Fmt.line("§6§lAUCTION"));
-            if (l.bidder == null) lore.add(Fmt.line("§7Starting bid: §e" + Fmt.cd(l.price)));
-            else {
-                lore.add(Fmt.line("§7Top bid: §e" + Fmt.cd(l.currentBid) + " §7by §f" + l.bidderName));
-                lore.add(Fmt.line("§7Bids: §f" + l.bidCount));
-            }
-            lore.add(Fmt.line("§7Ends in: §f" + Fmt.duration(l.endsAt - now)));
+    static ItemStack icon(Item item, String name, String... lore) { return named(new ItemStack(item), name, lore); }
+
+    static ItemStack named(ItemStack s, String name, String... lore) {
+        s.set(DataComponents.CUSTOM_NAME, Component.literal(name).withStyle(st -> st.withItalic(false)));
+        List<Component> lines = new ArrayList<>();
+        for (String l : lore) lines.add(Component.literal(l).withStyle(st -> st.withItalic(false)));
+        if (!lines.isEmpty()) s.set(DataComponents.LORE, new ItemLore(lines));
+        return s;
+    }
+
+    static ItemStack glow(ItemStack s) { s.set(DataComponents.ENCHANTMENT_GLINT_OVERRIDE, true); return s; }
+
+    static String timeLeft(long endsAt) {
+        long s = Math.max(0, (endsAt - System.currentTimeMillis()) / 1000);
+        if (s >= 86400) return (s / 86400) + "d " + (s % 86400 / 3600) + "h";
+        if (s >= 3600) return (s / 3600) + "h " + (s % 3600 / 60) + "m";
+        if (s >= 60) return (s / 60) + "m " + (s % 60) + "s";
+        return s + "s";
+    }
+
+    private static void sound(ServerPlayer p, SoundEvent s, float pitch) { p.playNotifySound(s, SoundSource.MASTER, 0.6f, pitch); }
+    private static void click(ServerPlayer p) { sound(p, SoundEvents.EXPERIENCE_ORB_PICKUP, 1.4f); }
+    private static void good(ServerPlayer p) { sound(p, SoundEvents.PLAYER_LEVELUP, 1.3f); }
+    private static void bad(ServerPlayer p) { sound(p, SoundEvents.VILLAGER_NO, 1f); }
+
+    private static void tell(ServerPlayer p, String msg) { p.sendSystemMessage(Component.literal("§6§l[GTS] §r" + msg)); }
+
+    /** The card shown for a listing in the market grid. */
+    static ItemStack display(Listing l, boolean mineView) {
+        ItemStack base = Market.decode(l.itemSnbt);
+        if (base.isEmpty()) base = new ItemStack(Items.BARRIER);
+        boolean auction = l.mode == Listing.Mode.AUCTION;
+        List<String> lore = new ArrayList<>();
+        lore.add(auction ? "§6§l⚖ AUCTION" : "§a§l✔ BUY IT NOW");
+        lore.add("");
+        if (l.kind == Listing.Kind.POKEMON && l.details != null) lore.addAll(l.details);
+        else if (l.kind == Listing.Kind.ITEM) lore.add("§7Amount: §f" + base.getCount());
+        lore.add("");
+        if (auction) {
+            lore.add(l.bidder == null ? "§7Starting bid: §6" + Fmt.cd(l.price) : "§7Top bid: §6" + Fmt.cd(l.currentBid) + " §8(" + l.bidCount + " bids)");
         } else {
-            lore.add(Fmt.line("§a§lBUY IT NOW"));
-            lore.add(Fmt.line("§7Price: §e" + Fmt.cd(l.price)));
-            lore.add(Fmt.line("§7Expires in: §f" + Fmt.duration(l.endsAt - now)));
+            lore.add("§7Price: §a" + Fmt.cd(l.price));
         }
-        lore.add(Fmt.line("§8ID #" + l.id));
-        if (!detailed) { lore.add(Fmt.line(" ")); lore.add(Fmt.line("§e▶ Click to open", ChatFormatting.YELLOW)); }
-        s.set(DataComponents.LORE, new ItemLore(lore));
-        return s;
+        lore.add("§7Ends in: §f" + timeLeft(l.endsAt));
+        lore.add("§7Seller: §f" + (mineView ? "You" : l.sellerName));
+        lore.add("§8#" + l.id);
+        lore.add("");
+        lore.add("§e▶ Click for details");
+        return named(base.copy(), (auction ? "§6" : "§a") + l.title, lore.toArray(new String[0]));
     }
 
-    // ------------------------------------------------------------------ browse
-
-    static final class View {
-        int page;
-        Market.Filter filter = Market.Filter.ALL;
-        Market.Sort sort = Market.Sort.ENDING_SOON;
-    }
-
-    private static final Map<UUID, View> VIEWS = new HashMap<>();
-    static View view(ServerPlayer p) { return VIEWS.computeIfAbsent(p.getUUID(), k -> new View()); }
+    private static final Item[] FILTER_ICONS = {Items.NETHER_STAR, Items.TOTEM_OF_UNDYING, Items.CHEST, Items.GOLDEN_HELMET, Items.EMERALD};
 
     private static String filterName(Market.Filter f) {
         return switch (f) { case ALL -> "Everything"; case POKEMON -> "Pokémon"; case ITEMS -> "Items"; case AUCTIONS -> "Auctions"; case BUY_NOW -> "Buy It Now"; };
     }
+
     private static String sortName(Market.Sort s) {
         return switch (s) { case NEWEST -> "Newest"; case ENDING_SOON -> "Ending soon"; case PRICE_LOW -> "Price: low to high"; case PRICE_HIGH -> "Price: high to low"; };
+    }
+
+    // ================================================================== the market
+
+    private static final int[] GRID = innerSlots(6);
+
+    private static int[] innerSlots(int rows) {
+        List<Integer> s = new ArrayList<>();
+        for (int r = 1; r < rows - 1; r++) for (int c = 1; c < 8; c++) s.add(r * 9 + c);
+        return s.stream().mapToInt(Integer::intValue).toArray();
     }
 
     public static void browse(ServerPlayer p) {
         View v = view(p);
         List<Listing> all = Market.query(v.filter, v.sort, null);
-        int pages = Math.max(1, (all.size() + 44) / 45);
-        if (v.page >= pages) v.page = pages - 1;
-        if (v.page < 0) v.page = 0;
+        int pages = Math.max(1, (all.size() + GRID.length - 1) / GRID.length);
+        v.page = Math.max(0, Math.min(v.page, pages - 1));
 
-        Screen s = new Screen("§6§l⚑ Global Trade System", 6);
-        int from = v.page * 45;
-        for (int i = 0; i < 45 && from + i < all.size(); i++) {
-            Listing l = all.get(from + i);
-            s.set(i, display(l, false), c -> detail(c.player(), l.id, false));
+        Screen s = new Screen("§1§l🌐 §9§lGlobal Trade System", 6);
+        s.frame(Items.BLUE_STAINED_GLASS_PANE, Items.LIGHT_BLUE_STAINED_GLASS_PANE);
+
+        long bal = Economy.balance(p);
+        int claims = Market.claimCount(p.getUUID());
+        s.set(4, glow(icon(Items.HEART_OF_THE_SEA, "§b§l🌐 Global Trade System",
+                "§7Trade Pokémon and items with",
+                "§7trainers across the whole server.", "",
+                "§7Listings: §f" + all.size(),
+                "§7Your balance: §6" + (bal >= 0 ? Fmt.cd(bal) : "?"),
+                "§7Page: §f" + (v.page + 1) + "§7/§f" + pages)));
+
+        if (all.isEmpty()) {
+            s.set(22, icon(Items.ENDER_EYE, "§7Nothing here yet",
+                    "§7Be the first to list something!", "", "§7Click §aSell§7 below to get started."));
         }
-        if (all.isEmpty()) s.set(22, icon(Items.BARRIER, "Nothing here yet", ChatFormatting.GRAY, "§7Be the first to list something!", "§7Use §f/gts sell §7or §f/gts auction"));
+        for (int i = 0; i < GRID.length; i++) {
+            int idx = v.page * GRID.length + i;
+            if (idx >= all.size()) break;
+            Listing l = all.get(idx);
+            boolean own = l.seller.equals(p.getUUID());
+            s.set(GRID[i], display(l, own), pl -> { click(pl); detail(pl, l.id, false); });
+        }
 
-        ItemStack dark = pane(Items.BLACK_STAINED_GLASS_PANE);
-        for (int i = 45; i < 54; i++) s.set(i, dark.copy());
-        s.set(45, icon(Items.ARROW, "◀ Previous page", ChatFormatting.YELLOW), c -> { v.page--; browse(c.player()); });
-        s.set(53, icon(Items.ARROW, "Next page ▶", ChatFormatting.YELLOW), c -> { v.page++; browse(c.player()); });
-        s.set(46, icon(Items.HOPPER, "Filter: " + filterName(v.filter), ChatFormatting.AQUA, "§7Click to change", "§8Everything, Pokémon, Items, Auctions, Buy It Now"),
-                c -> { Market.Filter[] f = Market.Filter.values(); v.filter = f[(v.filter.ordinal() + 1) % f.length]; v.page = 0; browse(c.player()); });
-        s.set(47, icon(Items.COMPARATOR, "Sort: " + sortName(v.sort), ChatFormatting.AQUA, "§7Click to change"),
-                c -> { Market.Sort[] f = Market.Sort.values(); v.sort = f[(v.sort.ordinal() + 1) % f.length]; v.page = 0; browse(c.player()); });
-        s.set(48, icon(Items.EMERALD, "Sell something", ChatFormatting.GREEN, "§7List a Pokémon or item", "§7for Buy It Now or auction"), c -> sellMenu(c.player()));
-        s.set(49, icon(Items.BOOK, "Page " + (v.page + 1) + " of " + pages, ChatFormatting.GOLD, "§7" + all.size() + " listings",
-                "§8/gts sell <price> [hours]", "§8/gts sellpokemon <slot> <price> [hours]", "§8/gts auction <start> <hours>", "§8/gts auctionpokemon <slot> <start> <hours>", "§8/gts mine   /gts claims"), c -> {});
-        s.set(50, icon(Items.NAME_TAG, "My listings", ChatFormatting.LIGHT_PURPLE, "§7You have §f" + Market.countOf(p.getUUID()) + "§7/" + GtsConfig.INSTANCE.maxListingsPerPlayer), c -> mine(c.player()));
-        int cl = Market.claimCount(p.getUUID());
-        s.set(51, icon(cl > 0 ? Items.CHEST_MINECART : Items.CHEST, "Claims" + (cl > 0 ? " §e(" + cl + ")" : ""), ChatFormatting.GOLD,
-                cl > 0 ? "§eThings are waiting for you!" : "§7Nothing waiting"), c -> claims(c.player()));
-        s.set(52, icon(Items.CLOCK, "Refresh", ChatFormatting.GRAY), c -> browse(c.player()));
+        // Bottom bar
+        if (v.page > 0) s.set(45, icon(Items.ARROW, "§e« Previous page", "§7Page " + v.page + " of " + pages), pl -> { click(pl); view(pl).page--; browse(pl); });
+        s.set(46, icon(FILTER_ICONS[v.filter.ordinal()], "§b§lShowing: §f" + filterName(v.filter),
+                "§7Click to change", "", list(Market.Filter.values(), v.filter.ordinal(), f -> filterName((Market.Filter) f))), pl -> {
+            click(pl); View w = view(pl);
+            w.filter = Market.Filter.values()[(w.filter.ordinal() + 1) % Market.Filter.values().length]; w.page = 0; browse(pl);
+        });
+        s.set(47, icon(Items.COMPARATOR, "§b§lSort: §f" + sortName(v.sort),
+                "§7Click to change", "", list(Market.Sort.values(), v.sort.ordinal(), o -> sortName((Market.Sort) o))), pl -> {
+            click(pl); View w = view(pl);
+            w.sort = Market.Sort.values()[(w.sort.ordinal() + 1) % Market.Sort.values().length]; w.page = 0; browse(pl);
+        });
+        s.set(48, glow(icon(Items.ENDER_EYE, "§d§l✦ Wonder Trade", "§7Send a Pokémon into the unknown", "§7and get a random one back.")), pl -> { click(pl); WonderTrade.openMain(pl); });
+        s.set(49, glow(icon(Items.EMERALD, "§a§l✚ Sell something", "§7List a Pokémon or the item", "§7in your hand.")), pl -> { click(pl); sellMenu(pl); });
+        s.set(50, icon(Items.CHEST, "§d§lMy listings", "§7See and cancel your listings."), pl -> { click(pl); mine(pl); });
+        ItemStack claimIcon = icon(claims > 0 ? Items.ENDER_CHEST : Items.BARREL, claims > 0 ? "§e§l✉ Claims §6(" + claims + ")" : "§7Claims",
+                claims > 0 ? "§eThings are waiting for you!" : "§7Nothing waiting right now.");
+        s.set(51, claims > 0 ? glow(claimIcon) : claimIcon, pl -> { click(pl); claims(pl); });
+        s.set(52, icon(Items.SUNFLOWER, "§7Refresh"), pl -> { click(pl); browse(pl); });
+        if (v.page < pages - 1) s.set(53, icon(Items.ARROW, "§eNext page »", "§7Page " + (v.page + 2) + " of " + pages), pl -> { click(pl); view(pl).page++; browse(pl); });
         open(p, s);
     }
 
-    // ------------------------------------------------------------------ detail
+    private interface Namer { String name(Object o); }
+
+    /** A lore line listing the options, with the current one highlighted. */
+    private static String list(Object[] options, int current, Namer n) {
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < options.length; i++) {
+            if (i > 0) b.append("§8, ");
+            b.append(i == current ? "§f§n" : "§8").append(n.name(options[i])).append("§r");
+        }
+        return b.toString();
+    }
+
+    // ================================================================== one listing
 
     static void detail(ServerPlayer p, String id, boolean fromMine) {
         Listing l = Market.data.listings.get(id);
-        if (l == null) { p.sendSystemMessage(Fmt.chat("[GTS] That listing is gone.", ChatFormatting.RED)); browse(p); return; }
-        Screen s = new Screen("§6Listing #" + l.id, 4);
-        s.border(pane(Items.GRAY_STAINED_GLASS_PANE));
-        s.set(4, display(l, true));
-        boolean owner = l.seller.equals(p.getUUID());
+        if (l == null) { bad(p); tell(p, "§cThat listing is gone."); if (fromMine) mine(p); else browse(p); return; }
+        View v = view(p);
+        boolean own = l.seller.equals(p.getUUID());
         boolean admin = p.hasPermissions(2);
-        Runnable back = () -> { if (fromMine) mine(p); else browse(p); };
+        boolean auction = l.mode == Listing.Mode.AUCTION;
 
-        if (l.mode == Listing.Mode.BUY_NOW) {
-            if (owner) s.set(13, icon(Items.GRAY_DYE, "This is your listing", ChatFormatting.GRAY, "§7You can cancel it below"));
-            else s.set(13, icon(Items.EMERALD_BLOCK, "Buy now for " + Fmt.cd(l.price), ChatFormatting.GREEN, "§7Click to confirm the purchase"), c -> {
-                String err = Market.buy(c.player(), l.id);
-                if (err != null) c.player().sendSystemMessage(Fmt.chat("[GTS] " + err, ChatFormatting.RED));
-                else c.player().sendSystemMessage(Fmt.chat("[GTS] Purchase complete! " + (l.kind == Listing.Kind.POKEMON ? "Check your party or PC." : "Check your inventory."), ChatFormatting.GREEN));
-                browse(c.player());
+        Screen s = new Screen(auction ? "§6§l⚖ Auction §8#" + l.id : "§2§l✔ Buy It Now §8#" + l.id, 6);
+        s.frame(auction ? Items.ORANGE_STAINED_GLASS_PANE : Items.LIME_STAINED_GLASS_PANE, auction ? Items.YELLOW_STAINED_GLASS_PANE : Items.GREEN_STAINED_GLASS_PANE);
+        s.set(13, display(l, own));
+        s.set(4, icon(Items.NAME_TAG, "§f" + l.title, "§7Seller: §f" + (own ? "You" : l.sellerName), "§7Ends in: §f" + timeLeft(l.endsAt)));
+
+        Runnable back = () -> { if (fromMine) mine(p); else browse(p); };
+        s.set(45, icon(Items.ARROW, "§e« Back"), pl -> { click(pl); view(pl).confirmBuy = null; back.run(); });
+
+        if (own) {
+            boolean locked = auction && l.bidder != null && !admin;
+            s.set(31, locked
+                    ? icon(Items.GRAY_DYE, "§7Can't cancel", "§7This auction already has bids.")
+                    : icon(Items.RED_CONCRETE, "§c§lCancel listing", "§7The goods go to your §e/gts claims§7."), pl -> {
+                if (locked) { bad(pl); return; }
+                String err = Market.cancel(pl, l.id, admin);
+                if (err != null) { bad(pl); tell(pl, "§c" + err); } else { good(pl); tell(pl, "§aListing cancelled. Collect it with §e/gts claims§a."); }
+                mine(pl);
+            });
+        } else if (!auction) {
+            boolean armed = l.id.equals(v.confirmBuy);
+            s.set(31, glow(icon(armed ? Items.GOLD_BLOCK : Items.EMERALD_BLOCK, armed ? "§6§l⚠ Click again to confirm" : "§a§lBuy for " + Fmt.cd(l.price),
+                    armed ? "§7You'll pay §6" + Fmt.cd(l.price) + "§7." : "§7Click to buy.")), pl -> {
+                View w = view(pl);
+                if (!l.id.equals(w.confirmBuy)) { click(pl); w.confirmBuy = l.id; detail(pl, l.id, fromMine); return; }
+                w.confirmBuy = null;
+                String err = Market.buy(pl, l.id);
+                if (err != null) { bad(pl); tell(pl, "§c" + err); detail(pl, l.id, fromMine); return; }
+                good(pl);
+                tell(pl, "§aYou bought §f" + l.title + "§a! " + (l.kind == Listing.Kind.POKEMON ? "Check your party or PC." : "Check your inventory."));
+                browse(pl);
             });
         } else {
             long min = Market.minNextBid(l);
-            if (owner) s.set(13, icon(Items.GRAY_DYE, "This is your auction", ChatFormatting.GRAY, "§7Top bid: " + (l.bidder == null ? "none" : Fmt.cd(l.currentBid))));
-            else {
-                long[] amounts = { min, Math.max(min, Market.shownPrice(l) * 110 / 100), Math.max(min, Market.shownPrice(l) * 125 / 100), Math.max(min, Market.shownPrice(l) * 150 / 100), Math.max(min, Market.shownPrice(l) * 200 / 100) };
-                String[] names = { "Minimum bid", "Bid +10%", "Bid +25%", "Bid +50%", "Bid +100%" };
-                int[] slots = { 11, 12, 13, 14, 15 };
-                net.minecraft.world.item.Item[] mats = { Items.GOLD_NUGGET, Items.GOLD_INGOT, Items.GOLD_BLOCK, Items.DIAMOND, Items.DIAMOND_BLOCK };
-                for (int i = 0; i < slots.length; i++) {
-                    final long amt = amounts[i];
-                    s.set(slots[i], icon(mats[i], names[i] + ": " + Fmt.cd(amt), ChatFormatting.GOLD, "§7Click to bid", "§8Your CobbleDollars are held until you win or are outbid"), c -> {
-                        String err = Market.bid(c.player(), l.id, amt);
-                        if (err != null) c.player().sendSystemMessage(Fmt.chat("[GTS] " + err, ChatFormatting.RED));
-                        else c.player().sendSystemMessage(Fmt.chat("[GTS] Bid placed: " + Fmt.cd(amt), ChatFormatting.GREEN));
-                        detail(c.player(), l.id, fromMine);
-                    });
-                }
+            long[] bids = {min, raise(l, 10), raise(l, 25), raise(l, 50), raise(l, 100)};
+            String[] names = {"Minimum bid", "Bid +10%", "Bid +25%", "Bid +50%", "Bid +100%"};
+            Item[] items = {Items.GOLD_NUGGET, Items.GOLD_INGOT, Items.GOLD_BLOCK, Items.RAW_GOLD_BLOCK, Items.ENCHANTED_GOLDEN_APPLE};
+            int[] slots = {29, 30, 31, 32, 33};
+            s.set(22, icon(Items.CLOCK, "§6§lCurrent bid", l.bidder == null ? "§7No bids yet. Start: §6" + Fmt.cd(l.price) : "§6" + Fmt.cd(l.currentBid) + " §7by §f" + (l.bidder.equals(p.getUUID()) ? "You" : l.bidderName),
+                    "§7Bids: §f" + l.bidCount, "§8Late bids add 2 minutes to the clock."));
+            for (int i = 0; i < bids.length; i++) {
+                long amount = Math.max(bids[i], min);
+                s.set(slots[i], icon(items[i], "§e§l" + names[i] + ": §6" + Fmt.cd(amount), "§7Click to bid.", "", "§8Your CobbleDollars are held until", "§8you win or are outbid."), pl -> {
+                    String err = Market.bid(pl, l.id, amount);
+                    if (err != null) { bad(pl); tell(pl, "§c" + err); } else { good(pl); tell(pl, "§aYou bid §6" + Fmt.cd(amount) + "§a on §f" + l.title + "§a."); }
+                    detail(pl, l.id, fromMine);
+                });
             }
         }
-        if ((owner && !(l.mode == Listing.Mode.AUCTION && l.bidder != null)) || admin) {
-            s.set(22, icon(Items.RED_CONCRETE, owner ? "Cancel listing" : "Remove listing (admin)", ChatFormatting.RED, "§7Returns the goods to the seller's claims"), c -> {
-                String err = Market.cancel(c.player(), l.id, !owner && admin);
-                c.player().sendSystemMessage(err != null ? Fmt.chat("[GTS] " + err, ChatFormatting.RED) : Fmt.chat("[GTS] Listing cancelled. Collect it with /gts claims.", ChatFormatting.YELLOW));
-                back.run();
+        if (admin && !own) {
+            s.set(53, icon(Items.TNT, "§4§lRemove listing (admin)", "§7Returns the goods to the seller's claims."), pl -> {
+                String err = Market.cancel(pl, l.id, true);
+                if (err != null) { bad(pl); tell(pl, "§c" + err); } else { good(pl); tell(pl, "§aListing removed."); }
+                browse(pl);
             });
         }
-        s.set(27, icon(Items.ARROW, "◀ Back", ChatFormatting.YELLOW), c -> back.run());
-        s.set(35, icon(Items.CLOCK, "Refresh", ChatFormatting.GRAY), c -> detail(c.player(), l.id, fromMine));
         open(p, s);
     }
 
-    // ------------------------------------------------------------------ my listings, claims, sell
+    private static long raise(Listing l, int percent) {
+        long base = l.bidder == null ? l.price : l.currentBid;
+        return base + Math.max(1, base * percent / 100);
+    }
+
+    // ================================================================== your listings
 
     public static void mine(ServerPlayer p) {
-        List<Listing> list = Market.query(Market.Filter.ALL, Market.Sort.ENDING_SOON, p.getUUID());
-        Screen s = new Screen("§dMy listings", 6);
-        for (int i = 0; i < 45 && i < list.size(); i++) {
-            Listing l = list.get(i);
-            s.set(i, display(l, false), c -> detail(c.player(), l.id, true));
+        List<Listing> mine = Market.query(Market.Filter.ALL, Market.Sort.NEWEST, p.getUUID());
+        Screen s = new Screen("§5§lMy Listings", 6);
+        s.frame(Items.PURPLE_STAINED_GLASS_PANE, Items.MAGENTA_STAINED_GLASS_PANE);
+        s.set(4, icon(Items.CHEST, "§d§lMy listings", "§7You have §f" + mine.size() + "§7 of §f" + GtsConfig.INSTANCE.maxListingsPerPlayer + "§7 listings.", "", "§7Click one to see it or cancel it."));
+        if (mine.isEmpty()) s.set(22, icon(Items.ENDER_EYE, "§7You have no listings", "§7Use §aSell something§7 in the market."));
+        for (int i = 0; i < Math.min(GRID.length, mine.size()); i++) {
+            Listing l = mine.get(i);
+            s.set(GRID[i], display(l, true), pl -> { click(pl); detail(pl, l.id, true); });
         }
-        if (list.isEmpty()) s.set(22, icon(Items.BARRIER, "You have no listings", ChatFormatting.GRAY));
-        ItemStack dark = pane(Items.BLACK_STAINED_GLASS_PANE);
-        for (int i = 45; i < 54; i++) s.set(i, dark.copy());
-        s.set(45, icon(Items.ARROW, "◀ Back to market", ChatFormatting.YELLOW), c -> browse(c.player()));
-        s.set(49, icon(Items.NAME_TAG, list.size() + " / " + GtsConfig.INSTANCE.maxListingsPerPlayer + " listings", ChatFormatting.LIGHT_PURPLE));
+        s.set(45, icon(Items.ARROW, "§e« Back to market"), pl -> { click(pl); browse(pl); });
         open(p, s);
     }
+
+    // ================================================================== claims
 
     public static void claims(ServerPlayer p) {
-        List<ClaimEntry> list = Market.data.claims.getOrDefault(p.getUUID().toString(), new ArrayList<>());
-        Screen s = new Screen("§6Claims", 4);
-        s.border(pane(Items.GRAY_STAINED_GLASS_PANE));
-        int slot = 10;
-        for (ClaimEntry c : list) {
-            if (slot > 25) break;
-            if (slot % 9 == 8) slot += 2;
-            ItemStack st;
-            if (c.type == ClaimEntry.Type.MONEY) st = icon(Items.GOLD_INGOT, c.title, ChatFormatting.GOLD, "§7" + c.reason);
-            else {
-                st = Market.decode(c.itemSnbt);
-                if (st.isEmpty()) st = new ItemStack(Items.BARRIER);
-                st.set(DataComponents.LORE, new ItemLore(List.of(Fmt.line("§7" + c.reason))));
-                if (c.type == ClaimEntry.Type.POKEMON) st.set(DataComponents.CUSTOM_NAME, Component.literal(c.title).withStyle(x -> x.withItalic(false)));
-            }
-            s.set(slot++, st);
+        List<ClaimEntry> list = Market.data.claims.get(p.getUUID().toString());
+        Screen s = new Screen("§6§l✉ Claims", 6);
+        s.frame(Items.ORANGE_STAINED_GLASS_PANE, Items.YELLOW_STAINED_GLASS_PANE);
+        int n = list == null ? 0 : list.size();
+        s.set(4, icon(Items.ENDER_CHEST, "§6§lClaims", n == 0 ? "§7Nothing is waiting for you." : "§e" + n + (n == 1 ? " thing is" : " things are") + " waiting for you!",
+                "", "§7Items go to your inventory,", "§7Pokémon to your party or PC.", "§7Anything that doesn't fit stays here."));
+        if (n == 0) s.set(22, icon(Items.ENDER_EYE, "§7Nothing to collect"));
+        for (int i = 0; i < Math.min(GRID.length, n); i++) {
+            ClaimEntry c = list.get(i);
+            ItemStack shown = switch (c.type) {
+                case MONEY -> icon(Items.SUNFLOWER, "§6" + Fmt.cd(c.amount));
+                default -> { ItemStack it = Market.decode(c.itemSnbt); yield it.isEmpty() ? new ItemStack(Items.PAPER) : it.copy(); }
+            };
+            s.set(GRID[i], named(shown, "§f" + c.title, "§7" + c.reason));
         }
-        if (list.isEmpty()) s.set(13, icon(Items.BARRIER, "Nothing is waiting for you", ChatFormatting.GRAY));
-        else s.set(31, icon(Items.HOPPER, "Claim everything (" + list.size() + ")", ChatFormatting.GREEN, "§7Items go to your inventory, Pokémon to your party or PC", "§7Anything that doesn't fit stays here"), c -> {
-            int n = Market.claimAll(c.player());
-            c.player().sendSystemMessage(Fmt.chat("[GTS] Collected " + n + " " + (n == 1 ? "entry" : "entries") + ".", ChatFormatting.GREEN));
-            claims(c.player());
+        if (n > 0) s.set(49, glow(icon(Items.HOPPER, "§a§lCollect everything", "§7Click to collect all you can carry.")), pl -> {
+            int got = Market.claimAll(pl);
+            if (got > 0) { good(pl); tell(pl, "§aCollected " + got + (got == 1 ? " entry." : " entries.")); } else { bad(pl); tell(pl, "§7Nothing could be collected. Is your inventory or PC full?"); }
+            claims(pl);
         });
-        s.set(27, icon(Items.ARROW, "◀ Back", ChatFormatting.YELLOW), c -> browse(c.player()));
+        s.set(45, icon(Items.ARROW, "§e« Back to market"), pl -> { click(pl); browse(pl); });
         open(p, s);
     }
+
+    // ================================================================== sell menu
 
     static void sellMenu(ServerPlayer p) {
-        Screen s = new Screen("§aSell something", 4);
-        s.border(pane(Items.LIME_STAINED_GLASS_PANE));
-        s.set(4, icon(Items.EMERALD, "What do you want to sell?", ChatFormatting.GREEN, "§7Click a Pokémon or the item in your hand,", "§7then follow the clickable message in chat"));
+        Screen s = new Screen("§2§l✚ Sell Something", 5);
+        s.frame(Items.GREEN_STAINED_GLASS_PANE, Items.LIME_STAINED_GLASS_PANE);
+        s.set(4, icon(Items.EMERALD, "§a§lWhat do you want to sell?", "§7Click a Pokémon or the item in your hand,", "§7then click an option in chat."));
         try {
-            if (CobblemonBridge.available()) {
-                Object party = CobblemonBridge.party(p);
-                for (int i = 0; i < 6; i++) {
-                    Object pk = CobblemonBridge.partyGet(party, i);
-                    int slot = 10 + i;
-                    final int num = i + 1;
-                    if (pk == null) { s.set(slot, icon(Items.GRAY_STAINED_GLASS_PANE, "Empty slot " + num, ChatFormatting.DARK_GRAY)); continue; }
-                    CobblemonBridge.Snap snap = CobblemonBridge.snapshot(pk, Market.server.registryAccess());
-                    ItemStack st = snap.icon.copy();
-                    st.set(DataComponents.CUSTOM_NAME, Component.literal(snap.title).withStyle(x -> x.withItalic(false)));
-                    List<Component> lore = new ArrayList<>();
-                    for (String line : snap.lines) lore.add(Fmt.line(line));
-                    lore.add(Fmt.line(" "));
-                    lore.add(Fmt.line("§eClick to list this Pokémon"));
-                    st.set(DataComponents.LORE, new ItemLore(lore));
-                    s.set(slot, st, c -> {
-                        c.player().closeContainer();
-                        prompt(c.player(), "Pokémon in slot " + num, "/gts sellpokemon " + num + " ", "/gts auctionpokemon " + num + " ");
-                    });
-                }
+            Object party = CobblemonBridge.party(p);
+            int[] slots = {19, 20, 21, 23, 24, 25};
+            for (int i = 0; i < 6; i++) {
+                Object pk = CobblemonBridge.partyGet(party, i);
+                if (pk == null) { s.set(slots[i], icon(Items.GRAY_STAINED_GLASS_PANE, "§8Empty party slot")); continue; }
+                CobblemonBridge.Snap snap = CobblemonBridge.snapshot(pk, Market.server.registryAccess());
+                List<String> lore = new ArrayList<>(snap.lines);
+                lore.add(""); lore.add("§e▶ Click to list this Pokémon");
+                int slot = i + 1;
+                s.set(slots[i], named(snap.icon.copy(), snap.title, lore.toArray(new String[0])), pl -> { click(pl); prompt(pl, "Party slot " + slot, "/gts sellpokemon " + slot + " ", "/gts auctionpokemon " + slot + " "); });
             }
-        } catch (Throwable t) {
-            GtsMod.LOG.error("[GTS] Could not show the party in the sell menu", t);
-        }
-        ItemStack held = p.getMainHandItem();
-        if (!held.isEmpty()) {
-            ItemStack st = held.copy();
-            List<Component> lore = new ArrayList<>();
-            ItemLore old = st.get(DataComponents.LORE);
-            if (old != null) lore.addAll(old.lines());
-            lore.add(Fmt.line(" "));
-            lore.add(Fmt.line("§eClick to list the item in your hand"));
-            st.set(DataComponents.LORE, new ItemLore(lore));
-            s.set(22, st, c -> {
-                c.player().closeContainer();
-                prompt(c.player(), "the item in your hand", "/gts sell ", "/gts auction ");
-            });
-        } else {
-            s.set(22, icon(Items.GRAY_DYE, "No item in your hand", ChatFormatting.GRAY, "§7Hold the item you want to sell,", "§7then open this menu again"));
-        }
-        s.set(27, icon(Items.ARROW, "◀ Back", ChatFormatting.YELLOW), c -> browse(c.player()));
+        } catch (Throwable t) { GtsMod.LOG.error("[GTS] Could not show the party in the sell menu", t); }
+        ItemStack hand = p.getMainHandItem();
+        s.set(22, hand.isEmpty()
+                ? icon(Items.BARRIER, "§7No item in your hand", "§7Hold the item you want to sell,", "§7then open this menu again.")
+                : glow(named(hand.copy(), "§f" + hand.getHoverName().getString() + (hand.getCount() > 1 ? " x" + hand.getCount() : ""), "", "§e▶ Click to list the item in your hand")),
+                pl -> { if (pl.getMainHandItem().isEmpty()) { bad(pl); return; } click(pl); prompt(pl, "the item in your hand", "/gts sell ", "/gts auction "); });
+        s.set(36, icon(Items.ARROW, "§e« Back to market"), pl -> { click(pl); browse(pl); });
         open(p, s);
     }
 
-    static void prompt(ServerPlayer p, String what, String binCmd, String aucCmd) {
-        p.sendSystemMessage(Fmt.chat("[GTS] ", ChatFormatting.GOLD).append(Fmt.chat("Listing " + what + ". Click one, then type the price:", ChatFormatting.YELLOW)));
-        p.sendSystemMessage(Component.literal("  ").append(
-                Component.literal("[Buy It Now]").withStyle(st -> st.withColor(ChatFormatting.GREEN).withBold(true)
-                        .withClickEvent(new net.minecraft.network.chat.ClickEvent(net.minecraft.network.chat.ClickEvent.Action.SUGGEST_COMMAND, binCmd))
-                        .withHoverEvent(new net.minecraft.network.chat.HoverEvent(net.minecraft.network.chat.HoverEvent.Action.SHOW_TEXT, Component.literal("Type the price after the command: <price> [hours]")))))
-                .append(Component.literal("   "))
-                .append(Component.literal("[Auction]").withStyle(st -> st.withColor(ChatFormatting.GOLD).withBold(true)
-                        .withClickEvent(new net.minecraft.network.chat.ClickEvent(net.minecraft.network.chat.ClickEvent.Action.SUGGEST_COMMAND, aucCmd))
-                        .withHoverEvent(new net.minecraft.network.chat.HoverEvent(net.minecraft.network.chat.HoverEvent.Action.SHOW_TEXT, Component.literal("Type the start price and hours: <start> <hours>"))))));
+    /** Closes the menu and puts two clickable choices in chat that fill in the command. */
+    static void prompt(ServerPlayer p, String what, String buyNowCmd, String auctionCmd) {
+        p.closeContainer();
+        MutableComponent bin = Component.literal("§a§l[Buy It Now]").withStyle(st -> st
+                .withClickEvent(new ClickEvent(ClickEvent.Action.SUGGEST_COMMAND, buyNowCmd))
+                .withHoverEvent(new HoverEvent(HoverEvent.Action.SHOW_TEXT, Component.literal("Type the price after the command: <price> [hours]"))));
+        MutableComponent auc = Component.literal("§6§l[Auction]").withStyle(st -> st
+                .withClickEvent(new ClickEvent(ClickEvent.Action.SUGGEST_COMMAND, auctionCmd))
+                .withHoverEvent(new HoverEvent(HoverEvent.Action.SHOW_TEXT, Component.literal("Type the start price and hours: <start> <hours>"))));
+        p.sendSystemMessage(Component.literal("§6§l[GTS] §7How do you want to sell " + what + "? ").append(bin).append(Component.literal(" ")).append(auc));
     }
 }
